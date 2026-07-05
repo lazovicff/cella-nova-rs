@@ -7,12 +7,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ggez = "0.9.3"
-ndarray = { version = "0.15.6", features = ["rayon"] }
+winit = "0.28"
+ndarray = "0.15.6"
 rustfft = "6.1.0"
 num-complex = "0.4.2"
-png = "0.17.7"
-rayon = "1.7.0"
 rand = "0.8.5"
 wgpu = "0.16"
 pollster = "0.4"
