@@ -79,6 +79,7 @@ mod fft;
 pub mod growth_functions;
 pub mod kernels;
 pub mod lenias;
+pub mod wfft;
 
 trait SetBytes {
     fn set_low(&mut self, value: u8);

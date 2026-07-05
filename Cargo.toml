@@ -14,3 +14,6 @@ num-complex = "0.4.2"
 png = "0.17.7"
 rayon = "1.7.0"
 rand = "0.8.5"
+wgpu = "0.16"
+pollster = "0.4"
+bytemuck = { version = "1.16", features = ["extern_crate_alloc"] }
