@@ -58,7 +58,8 @@ const GROWTH_FLOW_SHADER: &str = r#"
 struct Params { m: f32, s: f32, h: f32 }
 @group(0) @binding(0) var<storage, read> conv: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> result: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> conv_x: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i: u32 = id.x;
@@ -67,6 +68,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let diff: f32 = x - params.m;
     let g: f32 = exp(-(diff * diff) / (2.0 * params.s * params.s));
     result[i] = (2.0 * g - 1.0) * params.h;
+    conv_x[i] = x;
 }
 "#;
 
@@ -176,7 +178,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 const REINTEGRATION_SHADER: &str = r#"
-struct Params { width: u32, height: u32, dd: i32, sigma: f32, dt: f32, num_channels: u32, ma: f32 }
+struct Params { width: u32, height: u32, dd: i32, sigma: f32, dt: f32, num_channels: u32, ma: f32, basal_rate: f32, kinetic_cost: f32 }
 @group(0) @binding(0) var<storage, read> channel: array<f32>;
 @group(0) @binding(1) var<storage, read> flow_x: array<f32>;
 @group(0) @binding(2) var<storage, read> flow_y: array<f32>;
@@ -227,7 +229,65 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             sum = sum + a * area;
         }
     }
-    new_channel[idx] = sum;
+    // Metabolic costs: basal decay + kinetic cost proportional to local flow
+    let fx_self: f32 = clamp(flow_x[idx], -ma, ma);
+    let fy_self: f32 = clamp(flow_y[idx], -ma, ma);
+    let flow_mag: f32 = sqrt(fx_self * fx_self + fy_self * fy_self);
+    sum = sum * (1.0 - params.basal_rate * dt) - params.kinetic_cost * flow_mag * dt;
+    new_channel[idx] = max(sum, 0.0);
+}
+"#;
+
+const WALL_INTERACTION_SHADER: &str = r#"
+// Wall kernel from Sensorimotor Lenia:
+//   K_wall(r) = exp(-(r/2)^2/2) * sigmoid(-10*(r/2 - 1))
+//   G_wall(x) = -10 * max(0, x - 0.001)
+// Small-radius spatial convolution (7x7 neighborhood).
+struct Params { width: u32, height: u32, num_channels: u32 }
+@group(0) @binding(0) var<storage, read> obstacle: array<f32>;
+@group(0) @binding(1) var<storage, read_write> u_channel: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn wall_kernel(dist: f32) -> f32 {
+    let r = dist / 2.0;
+    let gaussian = exp(-r * r / 2.0);
+    let cutoff = 1.0 / (1.0 + exp(10.0 * (r - 1.0)));
+    return gaussian * cutoff;
+}
+
+fn wall_growth(x: f32) -> f32 {
+    return -10.0 * max(0.0, x - 0.001);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx: u32 = id.x;
+    let total: u32 = params.width * params.height * params.num_channels;
+    if (idx >= total) { return; }
+    let c: u32 = idx / (params.width * params.height);
+    let pixel: u32 = idx % (params.width * params.height);
+    let px: u32 = pixel % params.width;
+    let py: u32 = pixel / params.width;
+    let w: u32 = params.width;
+    let h: u32 = params.height;
+    let w_i32: i32 = i32(w);
+    let h_i32: i32 = i32(h);
+    // 7x7 neighborhood convolution
+    var conv: f32 = 0.0;
+    for (var dy: i32 = -3; dy <= 3; dy = dy + 1) {
+        for (var dx: i32 = -3; dx <= 3; dx = dx + 1) {
+            let nx: i32 = i32(px) + dx;
+            let ny: i32 = i32(py) + dy;
+            if (nx < 0 || nx >= w_i32 || ny < 0 || ny >= h_i32) { continue; }
+            let n_idx: u32 = u32(ny) * w + u32(nx);
+            let obs: f32 = obstacle[n_idx];
+            if (obs <= 0.0) { continue; }
+            let dist: f32 = sqrt(f32(dx * dx + dy * dy));
+            conv = conv + obs * wall_kernel(dist);
+        }
+    }
+    let growth: f32 = wall_growth(conv);
+    u_channel[idx] = u_channel[idx] + growth;
 }
 "#;
 
@@ -338,6 +398,8 @@ pub struct GpuFlowLenia {
     num_kernels: usize,
     dd: i32,
     sigma: f32,
+    basal_metabolic_rate: f32,
+    kinetic_cost: f32,
 
     // Channel mapping
     c0: Vec<u32>,
@@ -356,6 +418,8 @@ pub struct GpuFlowLenia {
     new_channel_buffer: wgpu::Buffer,
     /// Working buffer for FFT: [X*Y] vec2<f32>
     conv_buffer: wgpu::Buffer,
+    /// Convolution real part per kernel: [K * X * Y] f32
+    conv_x_buffer: wgpu::Buffer,
     /// All kernels packed: [X*Y*k] vec2<f32>
     kernel_buffer: wgpu::Buffer,
     /// All growth results: [X*Y*k] f32
@@ -374,6 +438,9 @@ pub struct GpuFlowLenia {
     flow_x_buffer: wgpu::Buffer,
     flow_y_buffer: wgpu::Buffer,
 
+    // Obstacle channel
+    obstacle_buffer: wgpu::Buffer,
+
     // FFT
     forward_fft_1d: Vec<WgpuFFT1D>,
     inverse_fft_1d: Vec<WgpuFFT1D>,
@@ -388,6 +455,7 @@ pub struct GpuFlowLenia {
     sum_channels_pipeline: wgpu::ComputePipeline,
     flow_field_pipeline: wgpu::ComputePipeline,
     reintegration_pipeline: wgpu::ComputePipeline,
+    wall_interaction_pipeline: wgpu::ComputePipeline,
 
     // Bind group layouts
     copy_to_conv_bgl: wgpu::BindGroupLayout,
@@ -399,6 +467,7 @@ pub struct GpuFlowLenia {
     sum_channels_bgl: wgpu::BindGroupLayout,
     flow_field_bgl: wgpu::BindGroupLayout,
     reintegration_bgl: wgpu::BindGroupLayout,
+    wall_interaction_bgl: wgpu::BindGroupLayout,
 
     // Cached bind groups (static bindings)
     normalize_bg: wgpu::BindGroup,
@@ -408,6 +477,7 @@ pub struct GpuFlowLenia {
     sum_channels_bg: wgpu::BindGroup,
     flow_field_bg: wgpu::BindGroup,
     reintegration_bg: wgpu::BindGroup,
+    wall_interaction_bg: wgpu::BindGroup,
 
     // Uniform buffers
     growth_params_buffer: wgpu::Buffer,
@@ -418,6 +488,7 @@ pub struct GpuFlowLenia {
     sum_channels_params_buffer: wgpu::Buffer,
     flow_field_params_buffer: wgpu::Buffer,
     reintegration_params_buffer: wgpu::Buffer,
+    wall_params_buffer: wgpu::Buffer,
 
     // Mapping buffers
     c1_flat_buffer: wgpu::Buffer,
@@ -442,6 +513,8 @@ impl GpuFlowLenia {
         dt: f32,
         dd: i32,
         sigma: f32,
+        basal_metabolic_rate: f32,
+        kinetic_cost: f32,
     ) -> Self {
         let device = &context.device;
         let queue = &context.queue;
@@ -453,7 +526,7 @@ impl GpuFlowLenia {
 
         // Flatten c1
         let mut c1_flat = Vec::new();
-        let mut c1_offsets = vec![0u32];
+        let mut c1_offsets = vec![0u32]; // start with 0
         for c in 0..num_channels {
             c1_flat.extend(c1[c].iter().cloned());
             c1_offsets.push(c1_flat.len() as u32);
@@ -498,6 +571,7 @@ impl GpuFlowLenia {
 
         let u_size = (total_elements * num_kernels * 4) as u64;
         let u_buffer = make_storage("fl::u", u_size);
+        let conv_x_buffer = make_storage("fl::conv_x", u_size);
 
         let uc_size = (total_elements * num_channels * 4) as u64;
         let u_channel_buffer = make_storage("fl::u_channel", uc_size);
@@ -511,6 +585,9 @@ impl GpuFlowLenia {
         let flow_x_buffer = make_storage("fl::flow_x", uc_size);
         let flow_y_buffer = make_storage("fl::flow_y", uc_size);
 
+        // Obstacle channel (single channel, X*Y f32)
+        let obstacle_buffer = make_storage("fl::obstacle", buf_size);
+
         // Uniform buffers
         let growth_params_buffer = make_uniform("fl::growth_params", 12);
         let normalize_params_buffer = make_uniform("fl::normalize_params", 4);
@@ -519,7 +596,8 @@ impl GpuFlowLenia {
         let sobel_params_a_buffer = make_uniform("fl::sobel_a_params", 12);
         let sum_channels_params_buffer = make_uniform("fl::sc_params", 8);
         let flow_field_params_buffer = make_uniform("fl::ff_params", 12);
-        let reintegration_params_buffer = make_uniform("fl::ri_params", 28);
+        let reintegration_params_buffer = make_uniform("fl::ri_params", 36);
+        let wall_params_buffer = make_uniform("fl::wall_params", 12);
 
         // Mapping buffers
         let c1_flat_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -563,6 +641,7 @@ impl GpuFlowLenia {
         let sum_channels_sm = sm("fl::sum_channels", SUM_CHANNELS_SHADER);
         let flow_field_sm = sm("fl::flow_field", FLOW_FIELD_SHADER);
         let reintegration_sm = sm("fl::reintegration", REINTEGRATION_SHADER);
+        let wall_interaction_sm = sm("fl::wall_interaction", WALL_INTERACTION_SHADER);
 
         // --- Bind group layout helpers ---
         let sro = |b: u32| wgpu::BindGroupLayoutEntry {
@@ -610,7 +689,7 @@ impl GpuFlowLenia {
         });
         let growth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fl::growth bgl"),
-            entries: &[sro(0), srw(1), unif(2)],
+            entries: &[sro(0), srw(1), srw(2), unif(3)],
         });
         let channel_aggregate_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -642,6 +721,11 @@ impl GpuFlowLenia {
             label: Some("fl::ri bgl"),
             entries: &[sro(0), sro(1), sro(2), srw(3), unif(4)],
         });
+        let wall_interaction_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fl::wall bgl"),
+                entries: &[sro(0), srw(1), unif(2)],
+            });
 
         // --- Pipeline layouts & pipelines ---
         let pl = |label: &str, bgl: &wgpu::BindGroupLayout| -> wgpu::PipelineLayout {
@@ -696,6 +780,11 @@ impl GpuFlowLenia {
             &pl("fl::ri pl", &reintegration_bgl),
             &reintegration_sm,
         );
+        let wall_interaction_pipeline = cp(
+            "fl::wall",
+            &pl("fl::wall pl", &wall_interaction_bgl),
+            &wall_interaction_sm,
+        );
 
         // --- Write uniform params ---
         let padded_n = forward_fft_1d[0].padded_len() as f32;
@@ -731,10 +820,10 @@ impl GpuFlowLenia {
             queue.write_buffer(&flow_field_params_buffer, 0, &data);
         }
 
-        // reintegration_params: width(u32), height(u32), dd(i32), sigma(f32), dt(f32), num_channels(u32), ma(f32)
+        // reintegration_params: width(u32), height(u32), dd(i32), sigma(f32), dt(f32), num_channels(u32), ma(f32), basal_rate(f32), kinetic_cost(f32)
         {
             let ma = dd as f32 - sigma;
-            let mut data = Vec::with_capacity(28);
+            let mut data = Vec::with_capacity(36);
             data.extend_from_slice(&(shape[0] as u32).to_le_bytes());
             data.extend_from_slice(&(shape[1] as u32).to_le_bytes());
             data.extend_from_slice(&(dd as i32).to_le_bytes());
@@ -742,7 +831,15 @@ impl GpuFlowLenia {
             data.extend_from_slice(&dt.to_le_bytes());
             data.extend_from_slice(&(num_channels as u32).to_le_bytes());
             data.extend_from_slice(&ma.to_le_bytes());
+            data.extend_from_slice(&basal_metabolic_rate.to_le_bytes());
+            data.extend_from_slice(&kinetic_cost.to_le_bytes());
             queue.write_buffer(&reintegration_params_buffer, 0, &data);
+        }
+
+        // wall_params: width(u32), height(u32), num_channels(u32)
+        {
+            let wp: [u32; 3] = [shape[0] as u32, shape[1] as u32, num_channels as u32];
+            queue.write_buffer(&wall_params_buffer, 0, bytemuck::cast_slice(&wp));
         }
 
         // --- Cached bind groups ---
@@ -919,6 +1016,25 @@ impl GpuFlowLenia {
             ],
         });
 
+        let wall_interaction_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fl::wall bg"),
+            layout: &wall_interaction_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: obstacle_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: u_channel_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wall_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         GpuFlowLenia {
             context,
             shape: shape.to_vec(),
@@ -928,6 +1044,8 @@ impl GpuFlowLenia {
             num_kernels,
             dd,
             sigma,
+            basal_metabolic_rate,
+            kinetic_cost,
             c0: c0.to_vec(),
             c1_flat,
             c1_offsets,
@@ -939,6 +1057,7 @@ impl GpuFlowLenia {
             conv_buffer,
             kernel_buffer,
             u_buffer,
+            conv_x_buffer,
             u_channel_buffer,
             nabla_u_x_buffer,
             nabla_u_y_buffer,
@@ -947,6 +1066,7 @@ impl GpuFlowLenia {
             sum_a_buffer,
             flow_x_buffer,
             flow_y_buffer,
+            obstacle_buffer,
             forward_fft_1d,
             inverse_fft_1d,
             copy_to_conv_pipeline,
@@ -958,6 +1078,7 @@ impl GpuFlowLenia {
             sum_channels_pipeline,
             flow_field_pipeline,
             reintegration_pipeline,
+            wall_interaction_pipeline,
             copy_to_conv_bgl,
             complex_mul_bgl,
             normalize_bgl,
@@ -967,6 +1088,7 @@ impl GpuFlowLenia {
             sum_channels_bgl,
             flow_field_bgl,
             reintegration_bgl,
+            wall_interaction_bgl,
             normalize_bg,
             channel_aggregate_bg,
             sobel_u_bg,
@@ -974,6 +1096,7 @@ impl GpuFlowLenia {
             sum_channels_bg,
             flow_field_bg,
             reintegration_bg,
+            wall_interaction_bg,
             growth_params_buffer,
             normalize_params_buffer,
             channel_aggregate_params_buffer,
@@ -982,6 +1105,7 @@ impl GpuFlowLenia {
             sum_channels_params_buffer,
             flow_field_params_buffer,
             reintegration_params_buffer,
+            wall_params_buffer,
             c1_flat_buffer,
             c1_offsets_buffer,
             readback_buffer,
@@ -1002,10 +1126,14 @@ impl GpuFlowLenia {
         self.num_channels
     }
 
+    pub fn num_kernels(&self) -> usize {
+        self.num_kernels
+    }
+
     pub fn set_dt(&mut self, dt: f32) {
         self.dt = dt;
         let ma = self.dd as f32 - self.sigma;
-        let mut data = Vec::with_capacity(28);
+        let mut data = Vec::with_capacity(36);
         data.extend_from_slice(&(self.shape[0] as u32).to_le_bytes());
         data.extend_from_slice(&(self.shape[1] as u32).to_le_bytes());
         data.extend_from_slice(&(self.dd as i32).to_le_bytes());
@@ -1013,6 +1141,8 @@ impl GpuFlowLenia {
         data.extend_from_slice(&dt.to_le_bytes());
         data.extend_from_slice(&(self.num_channels as u32).to_le_bytes());
         data.extend_from_slice(&ma.to_le_bytes());
+        data.extend_from_slice(&self.basal_metabolic_rate.to_le_bytes());
+        data.extend_from_slice(&self.kinetic_cost.to_le_bytes());
         self.context
             .queue
             .write_buffer(&self.reintegration_params_buffer, 0, &data);
@@ -1040,7 +1170,128 @@ impl GpuFlowLenia {
         );
     }
 
-    /// Downloads channel data from GPU.
+    /// Uploads obstacle data (single channel, values 0.0 or 1.0).
+    pub fn upload_obstacles(&self, data: &[f32]) {
+        assert_eq!(data.len(), self.total_elements);
+        self.context
+            .queue
+            .write_buffer(&self.obstacle_buffer, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Returns a reference to the obstacle buffer for rendering.
+    pub fn obstacle_buffer(&self) -> &wgpu::Buffer {
+        &self.obstacle_buffer
+    }
+
+    /// Update growth parameters for a single kernel.
+    pub fn set_growth_param(&mut self, k: usize, m: f32, s: f32, h: f32) {
+        self.kernel_m[k] = m;
+        self.kernel_s[k] = s;
+        self.kernel_h[k] = h;
+    }
+
+    /// Update all growth parameters at once.
+    pub fn set_all_growth_params(&mut self, m: &[f32], s: &[f32], h: &[f32]) {
+        self.kernel_m.copy_from_slice(m);
+        self.kernel_s.copy_from_slice(s);
+        self.kernel_h.copy_from_slice(h);
+    }
+
+    /// Run N iterations (forward pass).
+    pub fn run_steps(&self, n: usize) {
+        for _ in 0..n {
+            self.iterate();
+        }
+    }
+
+    /// Download all channel data concatenated.
+    pub fn download_all_channels(&self) -> Vec<f32> {
+        let device = &self.context.device;
+        let queue = &self.context.queue;
+        let total_floats = self.total_elements * self.num_channels;
+        let total_bytes = (total_floats * 4) as u64;
+
+        // Need a bigger readback buffer
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fl::readback_all"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fl::download_all"),
+        });
+        encoder.copy_buffer_to_buffer(&self.channel_buffer, 0, &readback, 0, total_bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let view = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
+        drop(view);
+        readback.unmap();
+        result
+    }
+
+    /// Download kernel FFT weights for a given kernel.
+    pub fn download_kernel(&self, k: usize) -> Vec<num_complex::Complex32> {
+        let device = &self.context.device;
+        let queue = &self.context.queue;
+        let total = self.total_elements;
+        let total_bytes = (total * 8) as u64;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fl::readback_k"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fl::download_k"),
+        });
+        let offset = (k * total * 8) as u64;
+        encoder.copy_buffer_to_buffer(&self.kernel_buffer, offset, &readback, 0, total_bytes);
+        queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let view = slice.get_mapped_range();
+        let raw: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
+        drop(view);
+        readback.unmap();
+        raw.chunks(2)
+            .map(|c| num_complex::Complex32::new(c[0], c[1]))
+            .collect()
+    }
+
+    /// Re-initialize all channels from flat f64 data.
+    pub fn reinit_channels(&self, data: &[Vec<f64>]) {
+        for (c, ch_data) in data.iter().enumerate() {
+            self.upload_channel(ch_data, c);
+        }
+    }
+
+    /// Get total elements (width * height).
+    pub fn total_elements(&self) -> usize {
+        self.total_elements
+    }
+
+    /// Get kernel_m slice.
+    pub fn kernel_m_slice(&self) -> &[f32] {
+        &self.kernel_m
+    }
+
+    /// Get kernel_s slice.
+    pub fn kernel_s_slice(&self) -> &[f32] {
+        &self.kernel_s
+    }
+
+    /// Get kernel_h slice.
+    pub fn kernel_h_slice(&self) -> &[f32] {
+        &self.kernel_h
+    }
+
     pub fn download_channel(&self, channel: usize) -> Vec<f32> {
         let device = &self.context.device;
         let queue = &self.context.queue;
@@ -1163,6 +1414,14 @@ impl GpuFlowLenia {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.conv_x_buffer,
+                            offset: u_offset,
+                            size: u_size,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: self.growth_params_buffer.as_entire_binding(),
                     },
                 ],
@@ -1257,6 +1516,16 @@ impl GpuFlowLenia {
                     encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ca") });
                 p.set_pipeline(&self.channel_aggregate_pipeline);
                 p.set_bind_group(0, &self.channel_aggregate_bg, &[]);
+                p.dispatch_workgroups(wg_c, 1, 1);
+            }
+
+            // Wall interaction: obstacle → negative growth on u_channel_buffer
+            {
+                let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("wall"),
+                });
+                p.set_pipeline(&self.wall_interaction_pipeline);
+                p.set_bind_group(0, &self.wall_interaction_bg, &[]);
                 p.dispatch_workgroups(wg_c, 1, 1);
             }
 

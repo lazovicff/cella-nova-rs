@@ -8,7 +8,7 @@ use winit::event::{Event, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
-const GRID_SIZE: usize = 1024;
+const GRID_SIZE: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Render shaders
@@ -32,6 +32,7 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> channel: array<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read> obstacle: array<f32>;
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
@@ -44,11 +45,18 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.01, 0.01, 0.02, 1.0);
     }
 
+    let idx = row * params.grid_size + col;
+
+    // Obstacles render as dark red
+    if (obstacle[idx] > 0.5) {
+        return vec4<f32>(0.25, 0.05, 0.05, 1.0);
+    }
+
     // Read all 3 channels from packed buffer
     let total_pixels = params.grid_size * params.grid_size;
-    let c0 = channel[row * params.grid_size + col];
-    let c1 = channel[total_pixels + row * params.grid_size + col];
-    let c2 = channel[2u * total_pixels + row * params.grid_size + col];
+    let c0 = channel[idx];
+    let c1 = channel[total_pixels + idx];
+    let c2 = channel[2u * total_pixels + idx];
 
     // RGB mapping with boosted contrast
     let r = clamp(c0 * 1.5, 0.0, 1.0);
@@ -70,28 +78,30 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 "#;
 
 // ---------------------------------------------------------------------------
-// Initialization helpers
+// Load trained kernels
 // ---------------------------------------------------------------------------
+/// Load trained kernel FFT weights from a binary file and upload to the simulation.
+fn load_trained_kernels(game: &GpuFlowLenia, path: &str) {
+    let data = std::fs::read(path).expect("Failed to load kernels file");
+    let header_bytes = 3 * 4; // 3 u32s
+    let header: &[u32] = bytemuck::cast_slice(&data[..header_bytes]);
+    let num_kernels = header[0] as usize;
+    let _grid_size = header[1] as usize;
+    let total = header[2] as usize;
+    let kernel_floats: &[f32] = bytemuck::cast_slice(&data[header_bytes..]);
 
-fn add_blob(array: &mut Array2<f64>, cx: usize, cy: usize, radius: f64, strength: f64) {
-    let shape = [array.shape()[0], array.shape()[1]];
-    let r = radius as i32;
-    let i_min = (cx as i32 - r).max(0) as usize;
-    let i_max = (cx as usize + r as usize).min(shape[0]);
-    let j_min = (cy as i32 - r).max(0) as usize;
-    let j_max = (cy as usize + r as usize).min(shape[1]);
-
-    for i in i_min..i_max {
-        for j in j_min..j_max {
-            let dx = i as f64 - cx as f64;
-            let dy = j as f64 - cy as f64;
-            let dist = (dx * dx + dy * dy).sqrt() / radius;
-            if dist < 1.0 {
-                let val = (-((dist - 0.5) * (dist - 0.5)) / (2.0 * 0.15 * 0.15)).exp();
-                array[[i, j]] = (array[[i, j]] + val * strength).min(1.0);
-            }
+    println!("Loading {} kernels from '{}'...", num_kernels, path);
+    for k in 0..num_kernels {
+        let offset = k * total * 2;
+        let mut kernel_data: Vec<num_complex::Complex32> = Vec::with_capacity(total);
+        for i in 0..total {
+            let re = kernel_floats[offset + i * 2];
+            let im = kernel_floats[offset + i * 2 + 1];
+            kernel_data.push(num_complex::Complex32::new(re, im));
         }
+        game.set_kernel(&kernel_data, k);
     }
+    println!("Loaded {} kernels.", num_kernels);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +109,9 @@ fn add_blob(array: &mut Array2<f64>, cx: usize, cy: usize, radius: f64, strength
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --- Interactive mode ---
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Flow Lenia: GPU-Accelerated Mass-Conserving Life")
@@ -178,6 +191,16 @@ fn main() {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -230,28 +253,29 @@ fn main() {
     let num_channels: usize = 3;
     let num_kernels: usize = 9;
 
-    // Channel mapping: 3x3 matrix
-    //   c0: which channel each kernel reads from
-    //   c1: which kernels contribute to each channel
-    // Matrix: [[2,1,0],[0,2,1],[1,0,2]] (cyclic food chain)
-    let c0: Vec<u32> = vec![2, 1, 0, 0, 2, 1, 1, 0, 2];
+    // Channel mapping: M = [[2,1,0],[0,2,1],[1,0,2]]
+    //   c0: source channel for each kernel
+    //   c1: which kernels contribute to each target channel
+    let c0: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 2, 2, 2];
     let c1: Vec<Vec<u32>> = vec![
-        vec![2, 3, 7], // channel 0 gets kernels 2,3,7
-        vec![1, 5, 6], // channel 1 gets kernels 1,5,6
-        vec![0, 4, 8], // channel 2 gets kernels 0,4,8
+        vec![0, 1, 6], // ch0: 2 self + 1 from ch2
+        vec![2, 3, 4], // ch1: 1 from ch0 + 2 self
+        vec![5, 7, 8], // ch2: 1 from ch1 + 2 self
     ];
 
-    // Per-kernel growth parameters (randomized for diversity)
+    // Per-kernel growth parameters — tuned for glider formation.
+    // Classic Lenia uses growth around μ≈0.15–0.3 with small σ.
+    // Mix of positive (growth) and negative (inhibition) heights.
     let mut rng = rand::thread_rng();
-    let kernel_m: Vec<f32> = (0..num_kernels).map(|_| rng.gen_range(0.05..0.5)).collect();
-    let kernel_s: Vec<f32> = (0..num_kernels)
-        .map(|_| rng.gen_range(0.001..0.18))
-        .collect();
-    let kernel_h: Vec<f32> = (0..num_kernels).map(|_| rng.gen_range(0.01..1.0)).collect();
+    let kernel_m: Vec<f32> = vec![0.15, 0.12, 0.28, 0.18, 0.10, 0.30, 0.22, 0.14, 0.25];
+    let kernel_s: Vec<f32> = vec![0.02, 0.03, 0.015, 0.025, 0.02, 0.018, 0.022, 0.028, 0.02];
+    let kernel_h: Vec<f32> = vec![0.8, -0.3, 0.6, 0.5, -0.4, 0.7, 0.4, -0.25, 0.55];
 
     let dt: f32 = 0.2;
     let dd: i32 = 5;
     let sigma: f32 = 0.65;
+    let basal_metabolic_rate: f32 = 0.001;
+    let kinetic_cost: f32 = 0.0005;
 
     let game = GpuFlowLenia::new(
         Arc::clone(&context),
@@ -266,57 +290,140 @@ fn main() {
         dt,
         dd,
         sigma,
+        basal_metabolic_rate,
+        kinetic_cost,
     );
 
-    // Generate Flow Lenia kernels
-    let global_r: f32 = rng.gen_range(2.0..25.0);
-    let radii: Vec<f32> = (0..num_kernels).map(|_| rng.gen_range(0.2..1.0)).collect();
-    let a: Vec<[f32; 3]> = (0..num_kernels)
-        .map(|_| {
-            [
-                rng.gen_range(0.0..1.0),
-                rng.gen_range(0.0..1.0),
-                rng.gen_range(0.0..1.0),
-            ]
-        })
-        .collect();
-    let w: Vec<[f32; 3]> = (0..num_kernels)
-        .map(|_| {
-            [
-                rng.gen_range(0.01..0.5),
-                rng.gen_range(0.01..0.5),
-                rng.gen_range(0.01..0.5),
-            ]
-        })
-        .collect();
-    let b: Vec<[f32; 3]> = (0..num_kernels)
-        .map(|_| {
-            [
-                rng.gen_range(0.001..1.0),
-                rng.gen_range(0.001..1.0),
-                rng.gen_range(0.001..1.0),
-            ]
-        })
-        .collect();
+    // Generate Flow Lenia kernels — Mexican-hat style for glider formation.
+    // Each kernel: positive center bump + negative ring = local excitation, global inhibition.
+    let global_r: f32 = 42.0; // characteristic scale for 512 grid
+    let radii: Vec<f32> = vec![0.8, 0.6, 1.0, 0.7, 0.5, 0.9, 0.65, 0.55, 0.85];
+    // a: bump positions (0=center, 1=edge). Center bump + ring bump.
+    let a: Vec<[f32; 3]> = vec![
+        [0.0, 0.6, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.7, 0.0],
+        [0.0, 0.55, 0.0],
+        [0.0, 0.45, 0.0],
+        [0.0, 0.65, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.6, 0.0],
+        [0.0, 0.55, 0.0],
+    ];
+    let w: Vec<[f32; 3]> = vec![
+        [0.08, 0.06, 0.01],
+        [0.07, 0.05, 0.01],
+        [0.09, 0.07, 0.01],
+        [0.08, 0.06, 0.01],
+        [0.07, 0.05, 0.01],
+        [0.09, 0.07, 0.01],
+        [0.08, 0.06, 0.01],
+        [0.07, 0.05, 0.01],
+        [0.08, 0.06, 0.01],
+    ];
+    let b: Vec<[f32; 3]> = vec![
+        [0.8, -0.3, 0.0],
+        [0.7, -0.25, 0.0],
+        [0.9, -0.35, 0.0],
+        [0.75, -0.3, 0.0],
+        [0.65, -0.2, 0.0],
+        [0.85, -0.35, 0.0],
+        [0.7, -0.25, 0.0],
+        [0.6, -0.2, 0.0],
+        [0.8, -0.3, 0.0],
+    ];
 
     let kernels_fft = generate_flow_kernels(shape, global_r, &radii, &a, &w, &b);
     for (k, kfft) in kernels_fft.iter().enumerate() {
         game.set_kernel(kfft, k);
     }
 
-    // Initialize channels with random blobs
+    // Load trained kernels if requested
+    if let Some(pos) = args.iter().position(|a| a == "--load-kernels") {
+        if let Some(path) = args.get(pos + 1) {
+            load_trained_kernels(&game, path);
+        } else {
+            load_trained_kernels(&game, "trained_kernels.bin");
+        }
+    }
+
+    // Initialize all channels with random noise patches.
+    // All channels need initial activation for cross-talk to develop.
+    let patch_size = (global_r as f64 * 1.5) as usize;
+    let patch_half = patch_size / 2;
+    let glider_positions: [(usize, usize); 3] = [
+        (shape / 2, shape / 2),
+        (shape / 3, shape / 2),
+        (2 * shape / 3, shape / 2),
+    ];
     for c in 0..num_channels {
         let mut ch = Array2::<f64>::zeros([shape; 2]);
-        for _ in 0..20 {
-            let x = rng.gen_range(30..shape - 30);
-            let y = rng.gen_range(30..shape - 30);
-            let radius = rng.gen_range(10.0..30.0);
-            add_blob(&mut ch, x, y, radius, 0.9);
+        let (cx, cy) = glider_positions[c];
+        let x0 = cx.saturating_sub(patch_half);
+        let y0 = cy.saturating_sub(patch_half);
+        for dy in 0..patch_size {
+            for dx in 0..patch_size {
+                let px = x0 + dx;
+                let py = y0 + dy;
+                if px < shape && py < shape {
+                    ch[[py, px]] = rng.gen_range(0.0..1.0);
+                }
+            }
         }
         let flat: Vec<f64> = ch.iter().copied().collect();
         let max_val = flat.iter().cloned().fold(0.0f64, f64::max);
         println!("Channel {c}: max initial value = {max_val:.4}");
         game.upload_channel(&flat, c);
+    }
+
+    // Initialize obstacles: vertical walls and scattered blocks (scaled for 256 grid)
+    {
+        let mut obstacles = vec![0.0f32; shape * shape];
+        // Vertical wall at x = shape/3
+        let wall_x = shape / 3;
+        for y in (shape / 8)..(7 * shape / 8) {
+            if y % 8 > 5 {
+                continue;
+            }
+            for dx in 0..2 {
+                let idx = y * shape + wall_x + dx;
+                if idx < obstacles.len() {
+                    obstacles[idx] = 1.0;
+                }
+            }
+        }
+        // Vertical wall at x = 2*shape/3
+        let wall_x2 = 2 * shape / 3;
+        for y in (shape / 8)..(7 * shape / 8) {
+            if y % 10 > 7 {
+                continue;
+            }
+            for dx in 0..2 {
+                let idx = y * shape + wall_x2 + dx;
+                if idx < obstacles.len() {
+                    obstacles[idx] = 1.0;
+                }
+            }
+        }
+        // Scattered obstacle disks
+        for _ in 0..8 {
+            let cx = rng.gen_range(shape / 6..5 * shape / 6);
+            let cy = rng.gen_range(shape / 6..5 * shape / 6);
+            let radius: i32 = rng.gen_range(2..6);
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx * dx + dy * dy > radius * radius {
+                        continue;
+                    }
+                    let px = (cx as i32 + dx) as usize;
+                    let py = (cy as i32 + dy) as usize;
+                    if px < shape && py < shape {
+                        obstacles[py * shape + px] = 1.0;
+                    }
+                }
+            }
+        }
+        game.upload_obstacles(&obstacles);
     }
 
     // --- Render bind group ---
@@ -334,6 +441,10 @@ fn main() {
                     binding: 1,
                     resource: render_params_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: game.obstacle_buffer().as_entire_binding(),
+                },
             ],
         });
 
@@ -341,7 +452,7 @@ fn main() {
     let mut paused = false;
     let mut last_fps_time = Instant::now();
     let mut frame_count: u32 = 0;
-    let mut debug_printed = false;
+    let mut total_frames: u32 = 0;
 
     println!("\n╔══════════════════════════════════════════════════════════╗");
     println!("║   🌊 Flow Lenia: GPU-Accelerated Mass-Conserving CA  🌊 ║");
@@ -353,6 +464,10 @@ fn main() {
     println!(
         "║  Reintegration tracking: dd={}, σ={}                ║",
         dd, sigma
+    );
+    println!(
+        "║  Metabolism: basal={}, kinetic={}            ║",
+        basal_metabolic_rate, kinetic_cost
     );
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Controls:                                              ║");
@@ -386,13 +501,26 @@ fn main() {
                 VirtualKeyCode::Space => paused = !paused,
                 VirtualKeyCode::R => {
                     let mut rng = rand::thread_rng();
+                    let patch_size = (global_r as f64 * 1.5) as usize;
+                    let patch_half = patch_size / 2;
+                    let glider_positions: [(usize, usize); 3] = [
+                        (shape / 2, shape / 2),
+                        (shape / 3, shape / 2),
+                        (2 * shape / 3, shape / 2),
+                    ];
                     for c in 0..num_channels {
                         let mut ch = Array2::<f64>::zeros([shape; 2]);
-                        for _ in 0..20 {
-                            let x = rng.gen_range(30..shape - 30);
-                            let y = rng.gen_range(30..shape - 30);
-                            let radius = rng.gen_range(10.0..30.0);
-                            add_blob(&mut ch, x, y, radius, 0.9);
+                        let (cx, cy) = glider_positions[c];
+                        let x0 = cx.saturating_sub(patch_half);
+                        let y0 = cy.saturating_sub(patch_half);
+                        for dy in 0..patch_size {
+                            for dx in 0..patch_size {
+                                let px = x0 + dx;
+                                let py = y0 + dy;
+                                if px < shape && py < shape {
+                                    ch[[py, px]] = rng.gen_range(0.0..1.0);
+                                }
+                            }
                         }
                         let flat: Vec<f64> = ch.iter().copied().collect();
                         game.upload_channel(&flat, c);
@@ -410,18 +538,37 @@ fn main() {
             }
 
             Event::RedrawRequested(_) => {
-                // Debug: print channel stats after a few frames
-                if !debug_printed && frame_count == 10 {
-                    debug_printed = true;
+                // Debug: print channel stats + center of mass at key frames
+                let debug_frames = [10, 30, 60, 120];
+                if debug_frames.contains(&total_frames) {
                     for c in 0..num_channels {
                         let data = game.download_channel(c);
                         let max_val = data.iter().cloned().fold(0.0f32, f32::max);
                         let sum: f32 = data.iter().sum();
                         let non_zero = data.iter().filter(|&&v| v > 0.001).count();
-                        println!("Frame {frame_count} ch{c}: max={max_val:.4}, sum={sum:.2}, non_zero={non_zero}/{}", data.len());
+                        // Center of mass
+                        let mut cx: f32 = 0.0;
+                        let mut cy: f32 = 0.0;
+                        for (i, &v) in data.iter().enumerate() {
+                            if v > 0.001 {
+                                let x = (i % shape) as f32;
+                                let y = (i / shape) as f32;
+                                cx += x * v;
+                                cy += y * v;
+                            }
+                        }
+                        if sum > 0.0 {
+                            cx /= sum;
+                            cy /= sum;
+                        }
+                        println!(
+                            "Frame {frame_count} ch{c}: max={max_val:.4}, sum={sum:.2}, non_zero={non_zero}/{}, com=({cx:.0},{cy:.0})",
+                            data.len()
+                        );
                     }
                 }
                 frame_count += 1;
+                total_frames += 1;
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_fps_time).as_secs_f64();
                 if elapsed >= 1.0 {
